@@ -1,52 +1,56 @@
-# backend/database/connection.py
 """
-Database Connection
---------------------
-SQLAlchemy engine, session factory, and table initialisation.
-Uses SQLite for the MVP; swap DATABASE_URL for Postgres in production.
+Async SQLAlchemy engine + session factory.
+Replaces the old synchronous SQLite connection.
 """
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase
+from backend.config import get_settings
+from backend.core.logging import get_logger
 
-import logging
+logger = get_logger(__name__)
+settings = get_settings()
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
-
-from backend.core.config import settings
-
-logger = logging.getLogger(__name__)
-
-DATABASE_URL = settings.database_url
-
-# SQLite needs check_same_thread=False for FastAPI's thread model
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-
-engine = create_engine(
-    DATABASE_URL,
-    connect_args=connect_args,
-    echo=False,  # set True for SQL query logging during debug
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=settings.DEBUG,
+    pool_size=10,
+    max_overflow=20,
     pool_pre_ping=True,
 )
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+    autocommit=False,
+)
 
 
 class Base(DeclarativeBase):
     pass
 
 
-def get_db():
-    """FastAPI dependency — yields a DB session and closes it after the request."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+async def get_db() -> AsyncSession:
+    """FastAPI dependency — yields an async DB session."""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
 
 
-def init_db():
-    """Create all tables defined in the models. Safe to call multiple times."""
-    # Import models so SQLAlchemy registers their metadata before create_all
-    from backend.models import user, restaurant, order  # noqa: F401
-
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created / verified.")
+async def init_db() -> None:
+    """Create all tables (dev only — use Alembic in production)."""
+    from backend.models import user, restaurant, order, rider  # noqa: F401
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("database_init", status="tables_created")
