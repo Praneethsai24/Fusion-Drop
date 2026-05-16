@@ -1,0 +1,21 @@
+/* RiderDashboardPage.module.css */
+.header    { display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--s8); gap:var(--s4); flex-wrap:wrap; }
+.greeting  { display:flex; align-items:center; gap:var(--s4); }
+.avatar    { width:56px;height:56px;border-radius:var(--r-full);background:var(--brand-muted);color:var(--brand);display:flex;align-items:center;justify-content:center; }
+.name      { font-size:var(--text-xl); font-weight:800; }
+.sub       { color:var(--text-muted); font-size:var(--text-sm); margin-top:var(--s1); }
+.statsGrid { display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s5);margin-bottom:var(--s10); }
+.statCard  { padding:var(--s5) var(--s6); }
+.statLabel { font-size:var(--text-xs);color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:var(--s2); }
+.statValue { font-size:var(--text-xl);font-weight:800; }
+.accentValue { color:var(--success); }
+.sectionTitle { font-size:var(--text-lg);font-weight:700;margin-bottom:var(--s5); }
+.orderList { display:flex;flex-direction:column;gap:var(--s4); }
+.orderRow  { display:flex;align-items:center;gap:var(--s5);padding:var(--s4) var(--s5);flex-wrap:wrap; }
+.orderLeft { display:flex;align-items:center;gap:var(--s3);min-width:160px; }
+.orderId   { font-weight:600;font-size:var(--text-sm); }
+.orderMid  { flex:1;display:flex;align-items:center;gap:var(--s2);font-size:var(--text-sm);color:var(--text-muted); }
+.orderRight{ display:flex;align-items:center;gap:var(--s4);margin-left:auto; }
+.amount    { font-weight:700;font-size:var(--text-base); }
+@media(max-width:768px){ .statsGrid{grid-template-columns:repeat(2,1fr);} }
+@media(max-width:480px){ .statsGrid{grid-template-columns:1fr;} }
