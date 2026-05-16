@@ -1,0 +1,6 @@
+/* RestaurantsPage.module.css */
+.header  { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--s6); gap: var(--s4); flex-wrap: wrap; }
+.title   { font-size: var(--text-xl); font-weight: 800; }
+.sub     { color: var(--text-muted); font-size: var(--text-sm); margin-top: var(--s1); }
+.filters { display: flex; gap: var(--s2); flex-wrap: wrap; margin-bottom: var(--s8); }
+.grid    { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: var(--s6); }
