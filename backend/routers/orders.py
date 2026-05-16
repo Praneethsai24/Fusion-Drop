@@ -1,18 +1,20 @@
-# backend/routers/orders.py
 """
 Order management — multi-restaurant checkout, status updates,
-delivery simulation, and order history.
+delivery simulation, cancellation, and order history.
+All DB access uses AsyncSession.
 """
+import asyncio
 import logging
 from typing import List
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth.jwt_handler import get_current_user
-from backend.database.connection import SessionLocal, get_db
+from backend.database.connection import AsyncSessionLocal, get_db
 from backend.models.order import Order, OrderStatus
-from backend.models.user import User
+from backend.models.user import User, UserRole
 from backend.schemas.order import (
     CheckoutRequest,
     OrderItemResponse,
@@ -22,23 +24,23 @@ from backend.schemas.order import (
 )
 from backend.services.order_service import OrderService
 from backend.websocket.manager import ws_manager
+from backend.core.exceptions import NotFoundError, UnauthorizedError, BadRequestError
+from backend.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
 
-def get_order_service(db: Session = Depends(get_db)) -> OrderService:
-    """
-    Dependency-injected OrderService.
+# ── Dependency ────────────────────────────────────────────────────────────────
 
-    This is a standard FastAPI DI pattern: routes depend on `OrderService`,
-    which itself depends on a database session.[cite:3][cite:1]
-    """
+async def get_order_service(
+    db: AsyncSession = Depends(get_db),
+) -> OrderService:
+    """Yield a fully-wired OrderService bound to the current request session."""
     return OrderService(db=db)
 
 
-# ── Checkout ──────────────────────────────────────────────────────
-
+# ── Checkout ──────────────────────────────────────────────────────────────────
 
 @router.post("/checkout", response_model=OrderResponse, status_code=201)
 async def checkout(
@@ -50,12 +52,12 @@ async def checkout(
     """
     Multi-restaurant checkout with intelligent delivery batching.
 
-    The heavy business logic is delegated to OrderService to keep the
-    handler focused on HTTP concerns and background task scheduling.
+    Heavy business logic is handled by OrderService. The handler is
+    responsible only for HTTP concerns and scheduling the background simulation.
     """
-    order, opt, items_out = order_service.create_order(payload, current_user)
+    order, opt, items_out = await order_service.create_order(payload, current_user)
 
-    # Background delivery simulation (unchanged)
+    # Fire-and-forget delivery simulation (does not block the response)
     background_tasks.add_task(_simulate_delivery, order.id)
 
     return OrderResponse(
@@ -75,76 +77,99 @@ async def checkout(
     )
 
 
-# ── Order history ─────────────────────────────────────────────────
-
+# ── Order history ─────────────────────────────────────────────────────────────
 
 @router.get("/my", response_model=List[OrderResponse])
-def my_orders(
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+async def my_orders(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
 ):
-    """Return all orders placed by the authenticated customer."""
-    return (
-        db.query(Order)
-        .filter(Order.customer_id == current_user.id)
+    """
+    Return all orders placed by the authenticated customer,
+    newest first. Supports pagination via skip/limit.
+    """
+    result = await db.execute(
+        select(Order)
+        .where(Order.customer_id == current_user.id)
         .order_by(Order.id.desc())
-        .all()
+        .offset(skip)
+        .limit(limit)
     )
+    return result.scalars().all()
 
 
 @router.get("/{order_id}", response_model=OrderResponse)
-def get_order(
+async def get_order(
     order_id: int,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """Fetch a single order (must belong to the current user or their rider)."""
-    order = db.query(Order).filter(Order.id == order_id).first()
+    """
+    Fetch a single order.
+    Only the order's customer or its assigned rider may access it.
+    """
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+
     if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+        raise NotFoundError("Order", order_id)
     if order.customer_id != current_user.id and order.rider_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
+        raise UnauthorizedError("Access denied — this order does not belong to you.")
+
     return order
 
 
-# ── Status update (rider action) ──────────────────────────────────
-
+# ── Status update (rider / admin action) ─────────────────────────────────────
 
 @router.patch("/{order_id}/status")
 async def update_order_status(
     order_id: int,
     payload: StatusUpdateRequest,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Update order status and broadcast via WebSocket.
+    Update order status and broadcast the change via WebSocket.
     Accepts optional rider GPS coordinates for live tracking.
     """
-    order = db.query(Order).filter(Order.id == order_id).first()
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
     if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+        raise NotFoundError("Order", order_id)
 
-    valid = [s.value for s in OrderStatus]
-    if payload.status not in valid:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid status. Choose from: {valid}"
+    valid_statuses = [s.value for s in OrderStatus]
+    if payload.status not in valid_statuses:
+        raise BadRequestError(
+            f"Invalid status '{payload.status}'. Valid values: {valid_statuses}"
         )
+
+    # Prevent invalid state transitions
+    _validate_status_transition(order.status, payload.status)
 
     order.status = payload.status
 
+    # Update rider GPS if provided
     if payload.rider_lat and payload.rider_lng and order.rider_id:
-        rider = db.query(User).filter(User.id == order.rider_id).first()
+        rider_result = await db.execute(
+            select(User).where(User.id == order.rider_id)
+        )
+        rider = rider_result.scalar_one_or_none()
         if rider:
             rider.current_lat = payload.rider_lat
             rider.current_lng = payload.rider_lng
 
+    # Free the rider when delivery is complete
     if payload.status == OrderStatus.delivered and order.rider_id:
-        rider = db.query(User).filter(User.id == order.rider_id).first()
+        rider_result = await db.execute(
+            select(User).where(User.id == order.rider_id)
+        )
+        rider = rider_result.scalar_one_or_none()
         if rider:
             rider.is_available = True
 
-    db.commit()
+    await db.commit()
 
     await ws_manager.broadcast_order_update(
         order_id,
@@ -157,24 +182,110 @@ async def update_order_status(
         },
     )
 
+    logger.info("order_status_updated", order_id=order_id, status=payload.status,
+                updated_by=current_user.id)
     return {"order_id": order_id, "status": payload.status}
 
 
-# ── Background delivery simulation ───────────────────────────────
+# ── Cancellation ──────────────────────────────────────────────────────────────
 
+@router.post("/{order_id}/cancel")
+async def cancel_order(
+    order_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Cancel an order. Only the placing customer may cancel,
+    and only before a rider has been assigned.
+    """
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+
+    if not order:
+        raise NotFoundError("Order", order_id)
+    if order.customer_id != current_user.id:
+        raise UnauthorizedError("Only the order's customer can cancel it.")
+
+    # Business rule: cannot cancel once a rider is en-route
+    non_cancellable = {
+        OrderStatus.picked_from_restaurant,
+        OrderStatus.all_items_picked,
+        OrderStatus.out_for_delivery,
+        OrderStatus.delivered,
+    }
+    if order.status in non_cancellable:
+        raise BadRequestError(
+            f"Cannot cancel an order with status '{order.status.value}'. "
+            "The rider is already on the way."
+        )
+    if order.status == OrderStatus.cancelled:
+        raise BadRequestError("Order is already cancelled.")
+
+    # Free the rider if one was assigned
+    if order.rider_id:
+        rider_result = await db.execute(
+            select(User).where(User.id == order.rider_id)
+        )
+        rider = rider_result.scalar_one_or_none()
+        if rider:
+            rider.is_available = True
+        order.rider_id = None
+
+    order.status = OrderStatus.cancelled
+    await db.commit()
+
+    await ws_manager.broadcast_order_update(
+        order_id,
+        {"order_id": order_id, "status": OrderStatus.cancelled.value},
+    )
+
+    logger.info("order_cancelled", order_id=order_id, customer_id=current_user.id)
+    return {"order_id": order_id, "status": OrderStatus.cancelled.value}
+
+
+# ── State machine guard ───────────────────────────────────────────────────────
+
+_VALID_TRANSITIONS: dict[str, set[str]] = {
+    OrderStatus.order_received.value: {
+        OrderStatus.rider_assigned.value,
+        OrderStatus.cancelled.value,
+    },
+    OrderStatus.rider_assigned.value: {
+        OrderStatus.picked_from_restaurant.value,
+        OrderStatus.cancelled.value,
+    },
+    OrderStatus.picked_from_restaurant.value: {
+        OrderStatus.all_items_picked.value,
+    },
+    OrderStatus.all_items_picked.value: {
+        OrderStatus.out_for_delivery.value,
+    },
+    OrderStatus.out_for_delivery.value: {
+        OrderStatus.delivered.value,
+    },
+    OrderStatus.delivered.value: set(),
+    OrderStatus.cancelled.value: set(),
+}
+
+
+def _validate_status_transition(current: OrderStatus, next_status: str) -> None:
+    allowed = _VALID_TRANSITIONS.get(current.value, set())
+    if next_status not in allowed:
+        raise BadRequestError(
+            f"Cannot transition from '{current.value}' to '{next_status}'. "
+            f"Allowed next statuses: {sorted(allowed) or ['none (terminal state)']}"
+        )
+
+
+# ── Background delivery simulation ───────────────────────────────────────────
 
 async def _simulate_delivery(order_id: int) -> None:
     """
     Simulates the full delivery lifecycle by advancing the order through
-    each status with realistic delays. Broadcasts every transition via
-    the WebSocket manager so the frontend updates in real time.
+    each status with realistic delays. Uses its own AsyncSession so it
+    is fully decoupled from the request session that has already responded.
     """
-    import asyncio
-
-    from backend.models.order import Order, OrderStatus
-    from backend.models.user import User
-
-    # (status, delay_seconds_before_transition)
     STEPS = [
         (OrderStatus.rider_assigned, 4),
         (OrderStatus.picked_from_restaurant, 8),
@@ -183,37 +294,45 @@ async def _simulate_delivery(order_id: int) -> None:
         (OrderStatus.delivered, 12),
     ]
 
-    await asyncio.sleep(3)  # brief initial pause
+    await asyncio.sleep(3)  # brief pause before the first transition
 
-    db = SessionLocal()
-    try:
-        for new_status, delay in STEPS:
-            await asyncio.sleep(delay)
-            order = db.query(Order).filter(Order.id == order_id).first()
-            if not order or order.status == OrderStatus.cancelled:
-                logger.info("[Sim] Order %s cancelled — stopping simulation", order_id)
-                break
+    async with AsyncSessionLocal() as db:
+        try:
+            for new_status, delay in STEPS:
+                await asyncio.sleep(delay)
 
-            order.status = new_status
+                result = await db.execute(select(Order).where(Order.id == order_id))
+                order = result.scalar_one_or_none()
 
-            if new_status == OrderStatus.delivered and order.rider_id:
-                rider = db.query(User).filter(User.id == order.rider_id).first()
-                if rider:
-                    rider.is_available = True
+                if not order:
+                    logger.warning("sim_order_missing", order_id=order_id)
+                    return
+                if order.status == OrderStatus.cancelled:
+                    logger.info("sim_stopped_cancelled", order_id=order_id)
+                    return
 
-            db.commit()
+                order.status = new_status
 
-            await ws_manager.broadcast_order_update(
-                order_id,
-                {
-                    "order_id": order_id,
-                    "status": new_status.value,
-                    "simulated": True,
-                },
-            )
-            logger.info("[Sim] Order %s → %s", order_id, new_status.value)
+                if new_status == OrderStatus.delivered and order.rider_id:
+                    rider_result = await db.execute(
+                        select(User).where(User.id == order.rider_id)
+                    )
+                    rider = rider_result.scalar_one_or_none()
+                    if rider:
+                        rider.is_available = True
 
-    except Exception as exc:
-        logger.error("[Sim] Error for order %s: %s", order_id, exc)
-    finally:
-        db.close()
+                await db.commit()
+
+                await ws_manager.broadcast_order_update(
+                    order_id,
+                    {
+                        "order_id": order_id,
+                        "status": new_status.value,
+                        "simulated": True,
+                    },
+                )
+                logger.info("sim_step", order_id=order_id, status=new_status.value)
+
+        except Exception as exc:
+            await db.rollback()
+            logger.error("sim_error", order_id=order_id, error=str(exc))
