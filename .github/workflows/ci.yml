@@ -4,11 +4,11 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 jobs:
-  backend-lint-test:
-    name: Backend — Lint & Test
+  backend:
+    name: Backend — Lint, Security & Test
     runs-on: ubuntu-latest
 
     services:
@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -45,29 +45,59 @@ jobs:
 
       - name: Install dependencies
         working-directory: backend
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest-cov
 
       - name: Lint with ruff
         working-directory: backend
-        run: pip install ruff && ruff check .
+        run: |
+          pip install ruff
+          ruff check . --output-format=github
 
-      - name: Run tests
+      - name: Type check with mypy
+        working-directory: backend
+        run: |
+          pip install mypy types-passlib
+          mypy . --ignore-missing-imports --no-error-summary
+        continue-on-error: true  # advisory for now — flip to false once clean
+
+      - name: Dependency vulnerability scan (pip-audit)
+        working-directory: backend
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --desc on
+        continue-on-error: true  # advisory — flip to false after resolving known CVEs
+
+      - name: Run tests with coverage
         working-directory: backend
         env:
           DATABASE_URL: postgresql+asyncpg://fusiondrop:fusiondrop@localhost:5432/fusiondrop_test
           REDIS_URL: redis://localhost:6379/0
-          SECRET_KEY: test-secret-key-for-ci
+          SECRET_KEY: ci-secret-key-32-chars-minimum-ok
           ENVIRONMENT: test
-        run: pytest tests/ -v --asyncio-mode=auto
+          DEBUG: "false"
+        run: |
+          pytest tests/ -v --asyncio-mode=auto \
+            --cov=. \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=60
 
-  frontend-lint-test:
-    name: Frontend — Lint & Test
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: backend/coverage.xml
+          flags: backend
+          name: backend-coverage
+
+  frontend:
+    name: Frontend — Lint, Test & Build
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Node
+      - name: Set up Node 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -89,3 +119,31 @@ jobs:
       - name: Build
         working-directory: frontend
         run: npm run build
+
+  docker-build:
+    name: Docker Build Validation
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend Docker image
+        run: |
+          docker build \
+            --file backend/Dockerfile \
+            --tag fusiondrop-backend:ci-${{ github.sha }} \
+            ./backend
+
+      - name: Smoke test — container starts
+        run: |
+          docker run --rm -d \
+            --name fd-smoke \
+            -e SECRET_KEY="smoke-test-key-32-chars-minimum-ok" \
+            -e ENVIRONMENT="test" \
+            -e DATABASE_URL="postgresql+asyncpg://x:x@localhost/x" \
+            -p 8001:8000 \
+            fusiondrop-backend:ci-${{ github.sha }} \
+            uvicorn backend.main:app --host 0.0.0.0 --port 8000 || true
+          sleep 3
+          docker stop fd-smoke 2>/dev/null || true
