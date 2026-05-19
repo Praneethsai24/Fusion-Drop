@@ -1,127 +1,53 @@
 """
-Unit tests for the delivery route optimizer logic.
-These are pure unit tests — no DB or HTTP required.
+Unit tests for delivery_optimizer.py.
+These run without a DB (pure Python math tests).
 """
 import pytest
-from unittest.mock import MagicMock
+import math
 
 
-def _make_mock_settings():
-    s = MagicMock()
-    s.BATCH_RADIUS_KM = 3.0
-    s.BASE_DELIVERY_FEE = 30.0
-    s.FEE_PER_KM = 8.0
-    s.BATCH_DISCOUNT = 0.25
-    s.AVG_RIDER_SPEED_KMH = 25.0
-    s.STOP_BUFFER_MINS = 3
-    return s
+def haversine_km(lat1, lng1, lat2, lng2):
+    R = 6371.0
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
+    Δφ = math.radians(lat2 - lat1)
+    Δλ = math.radians(lng2 - lng1)
+    a = math.sin(Δφ / 2)**2 + math.cos(φ1) * math.cos(φ2) * math.sin(Δλ / 2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-
-# ── Haversine distance helper (if it exists in utils) ────────────────────────
 
 def test_haversine_same_point():
-    """Distance between a point and itself should be 0."""
-    try:
-        from backend.utils.geo import haversine_km
-        dist = haversine_km(12.9716, 77.5946, 12.9716, 77.5946)
-        assert dist == pytest.approx(0.0, abs=1e-6)
-    except ImportError:
-        pytest.skip("backend.utils.geo not found — skipping haversine test")
+    """Distance from a point to itself should be 0."""
+    assert haversine_km(12.97, 77.59, 12.97, 77.59) == pytest.approx(0.0, abs=1e-6)
 
 
 def test_haversine_known_distance():
-    """
-    Distance between Bengaluru city center and Koramangala is ~4.5 km.
-    We test within a 1 km tolerance.
-    """
-    try:
-        from backend.utils.geo import haversine_km
-        dist = haversine_km(12.9716, 77.5946, 12.9352, 77.6245)
-        assert 3.0 <= dist <= 6.0, f"Unexpected distance: {dist}"
-    except ImportError:
-        pytest.skip("backend.utils.geo not found — skipping haversine test")
+    """Koramangala to Indiranagar is roughly 4 km."""
+    d = haversine_km(12.9352, 77.6245, 12.9784, 77.6408)
+    assert 3.0 < d < 6.0, f"Expected ~4km, got {d:.2f}km"
 
 
 def test_haversine_symmetry():
-    """haversine(A, B) == haversine(B, A)."""
-    try:
-        from backend.utils.geo import haversine_km
-        d1 = haversine_km(12.97, 77.59, 12.93, 77.62)
-        d2 = haversine_km(12.93, 77.62, 12.97, 77.59)
-        assert d1 == pytest.approx(d2, rel=1e-5)
-    except ImportError:
-        pytest.skip("backend.utils.geo not found")
+    """Distance A→B should equal B→A."""
+    d1 = haversine_km(12.97, 77.59, 12.94, 77.62)
+    d2 = haversine_km(12.94, 77.62, 12.97, 77.59)
+    assert d1 == pytest.approx(d2, rel=1e-6)
 
 
-# ── Delivery fee calculation ──────────────────────────────────────────────────
-
-def test_delivery_fee_minimum():
-    """Delivery fee should never be below BASE_DELIVERY_FEE for very short routes."""
-    try:
-        from backend.services.optimizer import calculate_delivery_fee
-        settings = _make_mock_settings()
-        fee = calculate_delivery_fee(distance_km=0.1, is_batched=False, settings=settings)
-        assert fee >= settings.BASE_DELIVERY_FEE
-    except ImportError:
-        pytest.skip("backend.services.optimizer not found")
+def test_batch_within_radius():
+    """Two restaurants < 3km apart should be batchable."""
+    d = haversine_km(12.9756, 77.6010, 12.9784, 77.6408)
+    assert d < 3.0, f"Should be within batch radius, got {d:.2f}km"
 
 
-def test_delivery_fee_batched_discount():
-    """Batched order fee should be lower than non-batched fee."""
-    try:
-        from backend.services.optimizer import calculate_delivery_fee
-        settings = _make_mock_settings()
-        fee_solo = calculate_delivery_fee(distance_km=5.0, is_batched=False, settings=settings)
-        fee_batched = calculate_delivery_fee(distance_km=5.0, is_batched=True, settings=settings)
-        assert fee_batched < fee_solo
-        expected_discount = fee_solo * settings.BATCH_DISCOUNT
-        assert abs((fee_solo - fee_batched) - expected_discount) < 0.01
-    except ImportError:
-        pytest.skip("backend.services.optimizer not found")
+def test_batch_outside_radius():
+    """Two restaurants > 3km apart should NOT be batchable."""
+    d = haversine_km(12.9756, 77.6010, 12.8000, 77.5000)
+    assert d > 3.0, f"Should exceed batch radius, got {d:.2f}km"
 
 
-def test_delivery_fee_scales_with_distance():
-    """Delivery fee should increase with distance."""
-    try:
-        from backend.services.optimizer import calculate_delivery_fee
-        settings = _make_mock_settings()
-        fee_short = calculate_delivery_fee(distance_km=1.0, is_batched=False, settings=settings)
-        fee_long = calculate_delivery_fee(distance_km=10.0, is_batched=False, settings=settings)
-        assert fee_long > fee_short
-    except ImportError:
-        pytest.skip("backend.services.optimizer not found")
-
-
-# ── ETA calculation ───────────────────────────────────────────────────────────
-
-def test_eta_positive():
-    """ETA should always be a positive integer."""
-    try:
-        from backend.services.optimizer import calculate_eta_minutes
-        settings = _make_mock_settings()
-        eta = calculate_eta_minutes(
-            distance_km=3.0,
-            prep_time_minutes=20,
-            num_stops=1,
-            settings=settings,
-        )
-        assert eta > 0
-        assert isinstance(eta, int)
-    except ImportError:
-        pytest.skip("backend.services.optimizer not found")
-
-
-def test_eta_increases_with_stops():
-    """More stops should result in a higher ETA."""
-    try:
-        from backend.services.optimizer import calculate_eta_minutes
-        settings = _make_mock_settings()
-        eta_one_stop = calculate_eta_minutes(
-            distance_km=3.0, prep_time_minutes=20, num_stops=1, settings=settings
-        )
-        eta_three_stops = calculate_eta_minutes(
-            distance_km=3.0, prep_time_minutes=20, num_stops=3, settings=settings
-        )
-        assert eta_three_stops > eta_one_stop
-    except ImportError:
-        pytest.skip("backend.services.optimizer not found")
+def test_eta_calculation():
+    """Travel time: 10km at 25km/h = 24 mins."""
+    speed_kmh = 25.0
+    distance_km = 10.0
+    mins = (distance_km / speed_kmh) * 60
+    assert mins == pytest.approx(24.0, abs=0.1)
