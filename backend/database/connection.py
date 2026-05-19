@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
-from backend.config import get_settings
+from backend.core.config import get_settings
 from backend.core.logging import get_logger
 
 logger = get_logger(__name__)
