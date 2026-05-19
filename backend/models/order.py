@@ -34,7 +34,7 @@ class Order(Base):
     delivery_lat           = Column(Float,   nullable=True)
     delivery_lng           = Column(Float,   nullable=True)
 
-    is_batched             = Column(String(10), default="false")   # "true"/"false" string
+    is_batched             = Column(Boolean, default=False)   
     estimated_eta_minutes  = Column(Integer,  default=45)
     notes                  = Column(Text,     nullable=True)
 
